@@ -26,21 +26,24 @@
 
 -- Returns the role of the current authenticated user.
 -- Falls back to 'anon' if not authenticated.
+-- NOTE: auth.uid() returns uuid; User.id is TEXT (offline-first CUID/UUID strings).
+-- Cast auth.uid()::text to make the comparison type-safe.
 CREATE OR REPLACE FUNCTION "current_user_role"()
 RETURNS TEXT AS $$
 DECLARE
   r TEXT;
 BEGIN
-  SELECT "role" INTO r FROM "User" WHERE "id" = auth.uid();
+  SELECT "role" INTO r FROM "User" WHERE "id" = auth.uid()::text;
   RETURN COALESCE(r, 'anon');
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER STABLE;
 
 -- Returns the id of the current authenticated user (or NULL).
+-- auth.uid() returns uuid; cast to text to match User.id type.
 CREATE OR REPLACE FUNCTION "current_app_user_id"()
 RETURNS TEXT AS $$
 BEGIN
-  RETURN auth.uid();
+  RETURN auth.uid()::text;
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER STABLE;
 
@@ -93,7 +96,7 @@ END $$;
 -- ============================================================
 -- Only management tier can read/write users. CASHIER can read their own row.
 CREATE POLICY "users_self_read"   ON "User" FOR SELECT TO authenticated
-  USING ("id" = auth.uid() OR "is_manager_tier"());
+  USING ("id" = auth.uid()::text OR "is_manager_tier"());
 CREATE POLICY "users_mgmt_write"  ON "User" FOR ALL TO authenticated
   USING ("is_manager_tier"()) WITH CHECK ("is_manager_tier"());
 
