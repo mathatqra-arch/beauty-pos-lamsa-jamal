@@ -129,7 +129,7 @@ export async function POST(req: NextRequest) {
       const supplierId = supplierIds[i % supplierIds.length]
       const sku = `PRD-${String(i + 1).padStart(4, '0')}`
 
-      await db.product.create({
+      const product = await db.product.create({
         data: {
           name,
           nameAr,
@@ -149,13 +149,23 @@ export async function POST(req: NextRequest) {
           allowNegativeStock: false,
           avgCost: cost,
           active: true,
-          // Note: currentStock + syncStatus are SQLite-only fields (desktop).
-          // In Supabase, stock is stored in the StockLevel table (below).
-          stockLevels: warehouse ? {
-            create: [{ warehouseId: warehouse.id, quantity: stock }]
-          } : undefined,
         },
       })
+      // Create StockLevel separately (db is a Supabase wrapper, not Prisma
+      // Client — nested relations like stockLevels: { create: [...] } don't work)
+      if (warehouse && product?.id) {
+        try {
+          await db.stockLevel.create({
+            data: {
+              productId: product.id,
+              warehouseId: warehouse.id,
+              quantity: stock,
+            },
+          })
+        } catch (e) {
+          // StockLevel may already exist — ignore duplicate
+        }
+      }
       productCount++
     }
 
@@ -181,8 +191,6 @@ export async function POST(req: NextRequest) {
     let customerCount = 0
     for (const [name, phone, email, tier] of customerData) {
       const points = tier === 'VIP' ? 5000 : tier === 'GOLD' ? 2000 : tier === 'SILVER' ? 800 : 100
-      // In Supabase, loyalty is stored in a separate LoyaltyAccount table
-      // (not denormalized on Customer — that's SQLite-only).
       const customer = await db.customer.create({
         data: {
           name,
@@ -190,17 +198,24 @@ export async function POST(req: NextRequest) {
           email,
           tier,
           active: true,
-          // Create the loyalty account in the same call (Prisma relation)
-          loyaltyAccount: {
-            create: {
+        },
+      })
+      // Create LoyaltyAccount separately (db is a Supabase wrapper)
+      if (customer?.id) {
+        try {
+          await db.loyaltyAccount.create({
+            data: {
+              customerId: customer.id,
               points,
               totalEarned: points,
               totalRedeemed: 0,
               tier,
             },
-          },
-        },
-      })
+          })
+        } catch (e) {
+          // LoyaltyAccount may already exist — ignore duplicate
+        }
+      }
       customerCount++
     }
 
