@@ -1,0 +1,576 @@
+// Professional POS + Inventory + CRM + Loyalty System Schema
+// ============================================================
+// ARCHITECTURE: The app uses Supabase REST API (PostgREST) for
+// database access via src/lib/db.ts — NOT Prisma Client.
+// This schema is kept for documentation and future migration
+// to Prisma when Supabase pooler is properly configured.
+//
+// Table names are PascalCase to match Supabase tables created
+// by supabase-schema.sql.
+// ============================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+// ============ AUTH & USERS ============
+
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  username     String   @unique
+  passwordHash String
+  name         String
+  phone        String?
+  role         String   @default("CASHIER") // OWNER, ADMIN, MANAGER, CASHIER, WAREHOUSE, ACCOUNTANT
+  permissions  String   @default("[]") // JSON array of permission strings
+  active       Boolean  @default(true)
+  pin          String?  // Quick PIN for POS operations
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  sales         Sale[]
+  purchases     Purchase[]
+  cashSessions  CashSession[]
+  expenses      Expense[]
+  stockAdjust   StockAdjustment[]
+  auditLogs     AuditLog[]
+  saleReturns   SaleReturn[]
+}
+
+// ============ STORE & REGISTER ============
+
+model Store {
+  id          String   @id @default(cuid())
+  name        String
+  address     String?
+  phone       String?
+  email       String?
+  taxId       String?
+  currency    String   @default("EGP")
+  logo        String?
+  receiptFooter String?
+  active      Boolean  @default(true)
+  createdAt   DateTime @default(now())
+
+  registers   Register[]
+  products    Product[]
+  sales       Sale[]
+  purchases   Purchase[]
+  warehouses  Warehouse[]
+}
+
+model Register {
+  id          String   @id @default(cuid())
+  name        String
+  storeId     String
+  store       Store    @relation(fields: [storeId], references: [id])
+  active      Boolean  @default(true)
+  createdAt   DateTime @default(now())
+
+  cashSessions CashSession[]
+  sales        Sale[]
+}
+
+model Warehouse {
+  id          String   @id @default(cuid())
+  name        String
+  storeId     String
+  store       Store    @relation(fields: [storeId], references: [id])
+  location    String?
+  createdAt   DateTime @default(now())
+
+  stockLevels    StockLevel[]
+  stockMovements StockMovement[]
+}
+
+// ============ PRODUCTS ============
+
+model Category {
+  id          String   @id @default(cuid())
+  name        String
+  nameAr      String?
+  parentId    String?
+  parent      Category? @relation("CategoryHierarchy", fields: [parentId], references: [id])
+  children    Category[] @relation("CategoryHierarchy")
+  color       String?
+  icon        String?
+  createdAt   DateTime @default(now())
+
+  products    Product[]
+}
+
+model Brand {
+  id        String   @id @default(cuid())
+  name      String
+  nameAr    String?
+  createdAt DateTime @default(now())
+
+  products  Product[]
+}
+
+model Unit {
+  id        String   @id @default(cuid())
+  name      String   // piece, kg, liter, box
+  shortName String?
+  createdAt DateTime @default(now())
+
+  products  Product[]
+}
+
+model Product {
+  id             String   @id @default(cuid())
+  name           String
+  nameAr         String?
+  sku            String   @unique
+  barcode        String?  @unique
+  barcodes       String   @default("[]") // JSON array of additional barcodes
+  categoryId     String?
+  category       Category? @relation(fields: [categoryId], references: [id])
+  brandId        String?
+  brand          Brand?   @relation(fields: [brandId], references: [id])
+  unitId         String?
+  unit           Unit?    @relation(fields: [unitId], references: [id])
+  supplierId     String?
+  supplier       Supplier? @relation(fields: [supplierId], references: [id])
+  storeId        String?
+  store          Store?   @relation(fields: [storeId], references: [id])
+
+  // Pricing — Decimal for financial accuracy (CWE-682)
+  purchaseCost   Decimal  @default(0) @db.Decimal(12, 2)
+  sellingPrice   Decimal  @default(0) @db.Decimal(12, 2)
+  wholesalePrice Decimal  @default(0) @db.Decimal(12, 2)
+  taxRate        Float    @default(0) // percentage (not money — Float OK)
+
+  // Inventory
+  minStock       Int      @default(0)
+  reorderLevel   Int      @default(0)
+  trackStock     Boolean  @default(true)
+  allowNegativeStock Boolean @default(false)
+
+  // Cost tracking (weighted average)
+  avgCost        Decimal  @default(0) @db.Decimal(12, 2)
+
+  image          String?
+  description    String?
+  active         Boolean  @default(true)
+
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  stockLevels    StockLevel[]
+  stockMovements StockMovement[]
+  saleItems      SaleItem[]
+  purchaseItems  PurchaseItem[]
+  saleReturnItems SaleReturnItem[]
+
+  @@index([categoryId])
+  @@index([supplierId])
+  @@index([brandId])
+  @@index([active])
+}
+
+// ============ INVENTORY ============
+
+model StockLevel {
+  id           String   @id @default(cuid())
+  productId    String
+  product      Product  @relation(fields: [productId], references: [id])
+  warehouseId  String
+  warehouse    Warehouse @relation(fields: [warehouseId], references: [id])
+  quantity     Int      @default(0)
+  updatedAt    DateTime @updatedAt
+
+  @@unique([productId, warehouseId])
+}
+
+model StockMovement {
+  id           String   @id @default(cuid())
+  productId    String
+  product      Product  @relation(fields: [productId], references: [id])
+  warehouseId  String
+  warehouse    Warehouse @relation(fields: [warehouseId], references: [id])
+  type         String   // PURCHASE, SALE, RETURN, ADJUSTMENT, TRANSFER_IN, TRANSFER_OUT, DAMAGE, OPENING_STOCK
+  quantity     Int      // positive in, negative out
+  refType      String?  // Sale, Purchase, Adjustment
+  refId        String?
+  note         String?
+  userId       String?
+  createdAt    DateTime @default(now())
+
+  @@index([productId])
+  @@index([warehouseId])
+  @@index([type])
+  @@index([refType, refId])
+  @@index([createdAt])
+}
+
+model StockAdjustment {
+  id           String   @id @default(cuid())
+  productId    String
+  warehouseId  String
+  oldQuantity  Int
+  newQuantity  Int
+  reason       String
+  note         String?
+  userId       String?
+  user         User?    @relation(fields: [userId], references: [id])
+  createdAt    DateTime @default(now())
+
+  // IDEMPOTENCY: prevents duplicate adjustment operations
+  clientTxnId  String?  @unique
+
+  @@index([productId])
+  @@index([warehouseId])
+}
+
+// ============ SUPPLIERS & PURCHASES ============
+
+model Supplier {
+  id          String   @id @default(cuid())
+  name        String
+  phone       String?
+  email       String?
+  address     String?
+  taxId       String?
+  balance     Decimal  @default(0) @db.Decimal(12, 2) // amount owed
+  createdAt   DateTime @default(now())
+
+  products    Product[]
+  purchases   Purchase[]
+}
+
+model Purchase {
+  id            String   @id @default(cuid())
+  invoiceNumber String
+  supplierId    String
+  supplier      Supplier @relation(fields: [supplierId], references: [id])
+  storeId       String?
+  store         Store?   @relation(fields: [storeId], references: [id])
+  warehouseId   String?
+  userId        String?
+  user          User?    @relation(fields: [userId], references: [id])
+
+  subtotal      Decimal  @default(0) @db.Decimal(12, 2)
+  taxAmount     Decimal  @default(0) @db.Decimal(12, 2)
+  discountAmount Decimal @default(0) @db.Decimal(12, 2)
+  total         Decimal  @default(0) @db.Decimal(12, 2)
+  paidAmount    Decimal  @default(0) @db.Decimal(12, 2)
+  status        String   @default("RECEIVED") // PENDING, RECEIVED, PARTIAL, PAID
+
+  // IDEMPOTENCY: prevents duplicate purchase operations
+  clientTxnId   String?  @unique
+
+  note          String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  items         PurchaseItem[]
+}
+
+model PurchaseItem {
+  id          String   @id @default(cuid())
+  purchaseId  String
+  purchase    Purchase @relation(fields: [purchaseId], references: [id], onDelete: Cascade)
+  productId   String
+  product     Product  @relation(fields: [productId], references: [id])
+  quantity    Int
+  unitCost    Decimal  @db.Decimal(12, 2)
+  taxRate     Float    @default(0) // percentage
+  total       Decimal  @db.Decimal(12, 2)
+}
+
+// ============ CUSTOMERS & LOYALTY ============
+
+model Customer {
+  id           String   @id @default(cuid())
+  name         String
+  phone        String?  @unique
+  email        String?
+  address      String?
+  notes        String?
+  birthday     DateTime?
+  tier         String   @default("BRONZE") // BRONZE, SILVER, GOLD, VIP
+  active       Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  sales        Sale[]
+  loyaltyAccount LoyaltyAccount?
+  loyaltyTransactions LoyaltyTransaction[]
+}
+
+model LoyaltyTier {
+  id               String  @id @default(cuid())
+  name             String  // BRONZE, SILVER, GOLD, VIP
+  displayName      String
+  minPoints        Int     @default(0)
+  earningMultiplier Float  @default(1.0)
+  discountPercent  Float   @default(0)
+  color            String?
+}
+
+model LoyaltyAccount {
+  id           String   @id @default(cuid())
+  customerId   String   @unique
+  customer     Customer @relation(fields: [customerId], references: [id])
+  points       Int      @default(0)
+  totalEarned  Int      @default(0)
+  totalRedeemed Int     @default(0)
+  tier         String   @default("BRONZE")
+  updatedAt    DateTime @updatedAt
+}
+
+model LoyaltyTransaction {
+  id           String   @id @default(cuid())
+  customerId   String
+  customer     Customer @relation(fields: [customerId], references: [id])
+  type         String   // EARN, REDEEM, EXPIRE, REVERSE, BONUS, ADJUSTMENT
+  points       Int      // positive earn, negative redeem
+  refType      String?  // Sale, SaleReturn, Campaign
+  refId        String?
+  note         String?
+  createdAt    DateTime @default(now())
+
+  // IDEMPOTENCY: prevents duplicate loyalty transactions
+  clientTxnId  String?  @unique
+
+  @@index([customerId])
+  @@index([type])
+}
+
+model LoyaltyCampaign {
+  id            String   @id @default(cuid())
+  name          String
+  description   String?
+  startDate     DateTime
+  endDate       DateTime
+  tierFilter    String?  // null = all, or specific tier
+  pointsMultiplier Float @default(1.0)
+  bonusPoints   Int      @default(0)
+  minPurchase   Decimal  @default(0) @db.Decimal(12, 2)
+  active        Boolean  @default(true)
+  createdAt     DateTime @default(now())
+}
+
+// ============ SALES ============
+
+model Sale {
+  id            String   @id @default(cuid())
+  invoiceNumber String   @unique
+  customerId    String?
+  customer      Customer? @relation(fields: [customerId], references: [id])
+  userId        String
+  user          User     @relation(fields: [userId], references: [id])
+  storeId       String?
+  store         Store?   @relation(fields: [storeId], references: [id])
+  registerId    String?
+  register      Register? @relation(fields: [registerId], references: [id])
+
+  subtotal      Decimal  @default(0) @db.Decimal(12, 2)
+  discountAmount Decimal @default(0) @db.Decimal(12, 2)
+  discountType  String?  // PERCENT, FIXED
+  taxAmount     Decimal  @default(0) @db.Decimal(12, 2)
+  total         Decimal  @default(0) @db.Decimal(12, 2)
+  paidAmount    Decimal  @default(0) @db.Decimal(12, 2)
+  changeAmount  Decimal  @default(0) @db.Decimal(12, 2)
+
+  status        String   @default("COMPLETED") // COMPLETED, HELD, REFUNDED, PARTIAL_REFUND
+  paymentMethod String   @default("CASH") // CASH, CARD, TRANSFER, SPLIT, OTHER
+  paymentDetails String  @default("{}") // JSON for split payments
+
+  loyaltyEarned Int      @default(0)
+  loyaltyRedeemed Int    @default(0)
+
+  // IDEMPOTENCY: prevents duplicate operations from network retries / offline sync
+  clientTxnId   String?  @unique
+
+  note          String?
+  held          Boolean  @default(false)
+
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  items         SaleItem[]
+  payments      SalePayment[]
+  returns       SaleReturn[]
+
+  @@index([customerId])
+  @@index([userId])
+  @@index([status])
+  @@index([paymentMethod])
+  @@index([createdAt])
+}
+
+model SaleItem {
+  id          String   @id @default(cuid())
+  saleId      String
+  sale        Sale     @relation(fields: [saleId], references: [id], onDelete: Cascade)
+  productId   String
+  product     Product  @relation(fields: [productId], references: [id])
+  quantity    Int
+  unitPrice   Decimal  @db.Decimal(12, 2)
+  discountAmount Decimal @default(0) @db.Decimal(12, 2)
+  taxAmount   Decimal  @default(0) @db.Decimal(12, 2)
+  total       Decimal  @db.Decimal(12, 2)
+  costAtSale  Decimal  @default(0) @db.Decimal(12, 2) // for profit calculation
+}
+
+model SalePayment {
+  id          String   @id @default(cuid())
+  saleId      String
+  sale        Sale     @relation(fields: [saleId], references: [id], onDelete: Cascade)
+  method      String   // CASH, CARD, TRANSFER, OTHER
+  amount      Decimal  @db.Decimal(12, 2)
+  createdAt   DateTime @default(now())
+}
+
+model SaleReturn {
+  id            String   @id @default(cuid())
+  returnNumber  String   @unique
+  saleId        String
+  sale          Sale     @relation(fields: [saleId], references: [id])
+  userId        String
+  user          User     @relation(fields: [userId], references: [id])
+  subtotal      Decimal  @default(0) @db.Decimal(12, 2)
+  taxAmount     Decimal  @default(0) @db.Decimal(12, 2)
+  total         Decimal  @default(0) @db.Decimal(12, 2)
+  refundMethod  String   @default("CASH")
+  reason        String?
+  status        String   @default("COMPLETED")
+  loyaltyReversed Int    @default(0)
+
+  // IDEMPOTENCY: prevents duplicate refund operations
+  clientTxnId   String?  @unique
+
+  createdAt     DateTime @default(now())
+
+  items         SaleReturnItem[]
+}
+
+model SaleReturnItem {
+  id          String   @id @default(cuid())
+  saleReturnId String
+  saleReturn   SaleReturn @relation(fields: [saleReturnId], references: [id], onDelete: Cascade)
+  saleItemId   String
+  productId    String
+  product      Product  @relation(fields: [productId], references: [id])
+  quantity     Int
+  unitPrice    Decimal  @db.Decimal(12, 2)
+  total        Decimal  @db.Decimal(12, 2)
+}
+
+// ============ CASH REGISTER ============
+
+model CashSession {
+  id            String   @id @default(cuid())
+  registerId    String
+  register      Register @relation(fields: [registerId], references: [id])
+  userId        String
+  user          User     @relation(fields: [userId], references: [id])
+  openingBalance Decimal @default(0) @db.Decimal(12, 2)
+  closingBalance Decimal?  @db.Decimal(12, 2)
+  expectedCash  Decimal?  @db.Decimal(12, 2)
+  difference    Decimal?  @db.Decimal(12, 2)
+  status        String   @default("OPEN") // OPEN, CLOSED
+  openedAt      DateTime @default(now())
+  closedAt      DateTime?
+
+  movements     CashMovement[]
+}
+
+model CashMovement {
+  id          String   @id @default(cuid())
+  sessionId   String
+  session     CashSession @relation(fields: [sessionId], references: [id])
+  type        String   // SALE, CASH_IN, CASH_OUT, REFUND, EXPENSE, OPENING, CLOSING
+  amount      Decimal  @db.Decimal(12, 2)
+  note        String?
+  refType     String?
+  refId       String?
+  createdAt   DateTime @default(now())
+
+  // IDEMPOTENCY: prevents duplicate cash movement operations
+  clientTxnId String?  @unique
+
+  @@index([sessionId])
+  @@index([type])
+}
+
+// ============ EXPENSES ============
+
+model ExpenseCategory {
+  id        String   @id @default(cuid())
+  name      String
+  nameAr    String?
+  color     String?
+  createdAt DateTime @default(now())
+
+  expenses  Expense[]
+}
+
+model Expense {
+  id           String   @id @default(cuid())
+  categoryId   String
+  category     ExpenseCategory @relation(fields: [categoryId], references: [id])
+  userId       String
+  user         User     @relation(fields: [userId], references: [id])
+  amount       Decimal  @db.Decimal(12, 2)
+  paymentMethod String @default("CASH")
+  note         String?
+  date         DateTime @default(now())
+  createdAt    DateTime @default(now())
+
+  // IDEMPOTENCY: prevents duplicate expense operations
+  clientTxnId  String?  @unique
+
+  @@index([categoryId])
+  @@index([userId])
+  @@index([date])
+}
+
+// ============ SETTINGS & AUDIT ============
+
+model Setting {
+  id        String   @id @default(cuid())
+  key       String   @unique
+  value     String
+  category  String   @default("general")
+  updatedAt DateTime @updatedAt
+}
+
+model AuditLog {
+  id        String   @id @default(cuid())
+  userId    String?
+  user      User?    @relation(fields: [userId], references: [id])
+  action    String
+  entity    String?
+  entityId  String?
+  before    String?  // JSON
+  after     String?  // JSON
+  ipAddress String?
+  device    String?
+  createdAt DateTime @default(now())
+}
+
+// ============ SYNC QUEUE (for offline support) ============
+
+model SyncQueue {
+  id          String   @id @default(cuid())
+  device      String
+  entityType  String   // Sale, StockMovement, etc.
+  entityId    String
+  operation   String   // CREATE, UPDATE, DELETE
+  payload     String   // JSON
+  status      String   @default("PENDING") // PENDING, SYNCED, FAILED
+  attempts    Int      @default(0)
+  error       String?
+  createdAt   DateTime @default(now())
+  syncedAt    DateTime?
+}

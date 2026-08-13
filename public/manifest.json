@@ -1,0 +1,41 @@
+{
+  "name": "لمسة جمال - نظام نقاط البيع",
+  "short_name": "لمسة جمال",
+  "description": "نظام نقاط بيع احترافي لمحل مستحضرات التجميل - يعمل بدون إنترنت",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#fdf2f8",
+  "theme_color": "#e11d48",
+  "dir": "rtl",
+  "lang": "ar",
+  "categories": ["business", "productivity", "shopping"],
+  "icons": [
+    {
+      "src": "/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ],
+  "shortcuts": [
+    {
+      "name": "نقطة البيع",
+      "short_name": "POS",
+      "url": "/?module=pos",
+      "description": "فتح شاشة الكاشير"
+    },
+    {
+      "name": "لوحة التحكم",
+      "short_name": "Dashboard",
+      "url": "/?module=dashboard"
+    }
+  ]
+}

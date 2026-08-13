@@ -1,0 +1,30 @@
+# ============================================================
+# Caddy Reverse Proxy Configuration
+# ============================================================
+# SECURITY: Removed the @transform_port_query block which allowed SSRF
+# via GET /?XTransformPort=5432 → localhost:5432 (Postgres).
+#
+# Now this file is a simple HTTPS reverse proxy to the Next.js app.
+# To enable, replace :81 with your domain and Caddy will auto-issue
+# a Let's Encrypt certificate.
+# ============================================================
+
+# Production configuration (uncomment and replace domain):
+# pos.lamsa-jamal.com {
+#     reverse_proxy localhost:3000 {
+#         header_up Host {host}
+#         header_up X-Forwarded-For {remote_host}
+#         header_up X-Forwarded-Proto {scheme}
+#         header_up X-Real-IP {remote_host}
+#     }
+# }
+
+# Development configuration (HTTP only — for local testing):
+:81 {
+    reverse_proxy localhost:3000 {
+        header_up Host {host}
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Forwarded-Proto {scheme}
+        header_up X-Real-IP {remote_host}
+    }
+}
