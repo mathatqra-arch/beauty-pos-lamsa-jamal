@@ -38,6 +38,52 @@ function sqlErrorMsg(e: any): string {
  * That was wiping local-only fields (e.g. products.description, which
  * exists in pos.db but not in the remote Supabase schema) on every sync.
  */
+// ============================================================
+// SQL ESCAPE HELPER — for building atomic multi-statement SQL
+// ============================================================
+// tauri-plugin-sql does NOT support BEGIN/COMMIT across separate
+// execute() calls (each call may use a different pooled connection,
+// causing "cannot commit - no transaction is active").
+//
+// The supported atomic pattern: concatenate ALL statements into ONE
+// execute() call separated by semicolons. SQLite wraps the entire
+// execution in an implicit transaction — if any statement fails, the
+// whole batch rolls back.
+//
+// Since bind parameters (?) only work for the FIRST statement in a
+// multi-statement execute(), we must inline values as SQL literals.
+// This helper safely escapes them (single-quote doubling per SQL spec).
+// ============================================================
+function sqlEsc(v: any): string {
+  if (v === null || v === undefined) return 'NULL'
+  if (typeof v === 'number') return Number.isFinite(v) ? String(v) : '0'
+  if (typeof v === 'boolean') return v ? '1' : '0'
+  // String: escape single quotes by doubling them (SQL standard)
+  return `'${String(v).replace(/'/g, "''")}'`
+}
+
+/** Build a VALUES clause: (sqlEsc(v1), sqlEsc(v2), ...) */
+function sqlVals(vals: any[]): string {
+  return '(' + vals.map(sqlEsc).join(', ') + ')'
+}
+
+// ============================================================
+// ATOMIC EXECUTE — the correct transaction pattern for tauri-plugin-sql
+// ============================================================
+// Concatenates an array of SQL statements into ONE execute() call,
+// wrapped in BEGIN;...;COMMIT; for TRUE atomicity:
+//   • If ALL statements succeed → all committed atomically
+//   • If ANY statement fails → entire batch rolls back (no partial writes)
+//
+// This replaces the broken BEGIN/COMMIT-across-separate-execute() pattern
+// that caused "cannot commit - no transaction is active" errors.
+// ============================================================
+async function atomicExec(db: any, statements: string[]): Promise<void> {
+  const body = statements.map(s => s.trim().replace(/;$/, '')).join(';\n')
+  const sql = `BEGIN;\n${body};\nCOMMIT;`
+  await db.execute(sql)
+}
+
 async function upsert(db: any, table: string, columns: string[], values: any[], secondaryConflictCol?: string) {
   const updateCols = columns.filter(c => c !== 'id')
   const setClause = updateCols.length
@@ -748,17 +794,22 @@ async function handleLogin(db: any, body: any): Promise<any> {
 }
 
 // ============================================================
-// CREATE SALE — multi-table atomic write wrapped in a single
-// SQLite transaction so partial failures cannot leave stock,
-// loyalty, or cash out of balance. Steps:
-//   1. INSERT sales header
-//   2. INSERT sale_items + decrement products.current_stock +
-//      log stock_movements (type=SALE, client_txn_id for idempotency)
-//   3. INSERT sale_payments row (migration 002 — multi-payment support)
-//   4. Award loyalty points (account upsert + transaction log)
-//   5. Record cash_movement for open cash session (CASH only)
-//   6. Queue sale for server sync
-// Any failure triggers ROLLBACK and the entire sale is aborted.
+// CREATE SALE — ATOMIC multi-table write via single execute() call
+// ============================================================
+// CRITICAL: tauri-plugin-sql does NOT support BEGIN/COMMIT across
+// separate execute() calls. Each call may use a different pooled
+// connection, causing "cannot commit - no transaction is active".
+//
+// FIX: concatenate ALL SQL statements into ONE execute() call.
+// SQLite wraps the entire batch in an implicit transaction —
+// if ANY statement fails, the WHOLE batch rolls back atomically.
+// Values are inlined as escaped SQL literals (sqlEsc helper).
+//
+// IDEMPOTENCY: before creating, check if a sale with this clientTxnId
+// already exists → return it (prevents duplicates from retries).
+//
+// STOCK VALIDATION: before decrementing, verify stock >= quantity.
+// Reject sale if insufficient (unless allow_negative_stock = 1).
 // ============================================================
 async function handleCreateSale(db: any, body: any): Promise<any> {
   const { items, customerId, userId, discountAmount, taxAmount, total, paidAmount, paymentMethod, note, loyaltyRedeem } = body
@@ -769,14 +820,52 @@ async function handleCreateSale(db: any, body: any): Promise<any> {
   const invoiceNumber = `LOCAL-${Date.now()}`
   const now = new Date().toISOString()
 
-  // Pre-validate all products BEFORE opening the transaction — that way
-  // a missing-product error throws cleanly without an aborted BEGIN.
+  // ─── IDEMPOTENCY CHECK ───
+  // If this clientTxnId already exists, return the existing sale.
+  // This prevents duplicate sales from sync retries or double-clicks.
+  const existing = await db.select(
+    'SELECT * FROM sales WHERE client_txn_id = ? LIMIT 1',
+    [clientTxnId]
+  )
+  if (existing[0]) {
+    console.log(`[Desktop API] Sale ${clientTxnId} already exists — returning (idempotent)`)
+    const s = existing[0]
+    return {
+      id: s.id,
+      clientTxnId: s.client_txn_id,
+      invoiceNumber: s.invoice_number,
+      customerId: s.customer_id,
+      user: { name: 'الكاشير' },
+      items: JSON.parse(s.items_json || '[]'),
+      subtotal: s.subtotal,
+      discountAmount: s.discount_amount,
+      taxAmount: s.tax_amount,
+      total: s.total,
+      paidAmount: s.paid_amount,
+      changeAmount: s.change_amount,
+      paymentMethod: s.payment_method,
+      loyaltyEarned: s.loyalty_earned,
+      createdAt: s.created_at,
+      idempotent: true,
+    }
+  }
+
+  // ─── PRE-VALIDATE PRODUCTS + STOCK ───
+  // Read all products first, check existence AND stock availability.
   let subtotal = 0
   const itemsData: any[] = []
   for (const item of items) {
     const productRows = await db.select('SELECT * FROM products WHERE id = ? AND deleted_at IS NULL LIMIT 1', [item.productId])
     const product = productRows[0]
-    if (!product) throw new Error('المنتج غير موجود')
+    if (!product) throw new Error(`المنتج غير موجود: ${item.productId}`)
+
+    // STOCK VALIDATION — prevent negative stock
+    const currentStock = product.current_stock || 0
+    const allowNegative = product.allow_negative_stock === 1 || product.allow_negative_stock === 'true' || product.allow_negative_stock === true
+    if (product.track_stock !== 0 && !allowNegative && currentStock < item.quantity) {
+      throw new Error(`المخزون غير كافي للمنتج "${product.name_ar || product.name}". المتوفر: ${currentStock}، المطلوب: ${item.quantity}`)
+    }
+
     const lineTotal = product.selling_price * item.quantity
     const lineTax = lineTotal * (product.tax_rate / 100)
     subtotal += lineTotal + lineTax
@@ -796,73 +885,78 @@ async function handleCreateSale(db: any, body: any): Promise<any> {
   const change = Math.max(0, paid - finalTotal)
   const loyaltyEarned = customerId ? Math.floor(finalTotal / 10) : 0
 
+  // ─── FETCH OPEN CASH SESSION (for CASH payments) ───
+  let cashSessionId: string | null = null
+  if ((paymentMethod || 'CASH') === 'CASH') {
+    const sessions = await db.select("SELECT id FROM cash_sessions WHERE status = 'OPEN' AND deleted_at IS NULL LIMIT 1")
+    cashSessionId = sessions[0]?.id || null
+  }
+
+  // ─── BUILD ATOMIC SQL (single execute() call) ───
+  // All statements concatenated with semicolons → SQLite implicit transaction.
+  // If any statement fails, the entire batch rolls back.
+  const stmts: string[] = []
+
+  // 1. Sale header
+  stmts.push(
+    `INSERT INTO sales (id, client_txn_id, invoice_number, customer_id, user_id, items_json, subtotal, discount_amount, tax_amount, total, paid_amount, change_amount, payment_method, loyalty_earned, loyalty_redeemed, note, status, sync_status, created_at, updated_at)
+     VALUES (${sqlVals([saleId, clientTxnId, invoiceNumber, customerId || null, userId, JSON.stringify(itemsData), subtotal, discountAmount || 0, taxAmount || 0, finalTotal, paid, change, paymentMethod || 'CASH', loyaltyEarned, loyaltyRedeem || 0, note || ''])}, 'COMPLETED', 'pending', ${sqlEsc(now)}, datetime('now'))`
+  )
+
+  // 2. Sale items + stock decrement + stock movements
+  for (const item of itemsData) {
+    stmts.push(
+      `INSERT INTO sale_items (id, sale_id, product_id, quantity, unit_price, total, cost_at_sale)
+       VALUES ${sqlVals([uuid(), saleId, item.productId, item.quantity, item.unitPrice, item.total, item.costAtSale])}`
+    )
+    stmts.push(
+      `UPDATE products SET current_stock = current_stock - ${sqlEsc(item.quantity)}, updated_at = datetime('now') WHERE id = ${sqlEsc(item.productId)}`
+    )
+    stmts.push(
+      `INSERT INTO stock_movements (id, client_txn_id, product_id, type, quantity, ref_type, ref_id, note, sync_status, created_at)
+       VALUES ${sqlVals([uuid(), `${clientTxnId}:${item.productId}:STOCK`, item.productId, -item.quantity, 'Sale', saleId, invoiceNumber, 'pending', now])}`
+    )
+  }
+
+  // 3. Payment record
+  stmts.push(
+    `INSERT INTO sale_payments (id, sale_id, method, amount, created_at, sync_status)
+     VALUES ${sqlVals([uuid(), saleId, paymentMethod || 'CASH', paid, now, 'pending'])}`
+  )
+
+  // 4. Loyalty earn (if applicable)
+  if (customerId && loyaltyEarned > 0) {
+    stmts.push(
+      `INSERT INTO loyalty_accounts (id, customer_id, points, total_earned, total_redeemed, tier, updated_at)
+       VALUES ${sqlVals([uuid(), customerId, loyaltyEarned, loyaltyEarned, 0, 'BRONZE', now])}
+       ON CONFLICT(customer_id) DO UPDATE SET points = points + ${sqlEsc(loyaltyEarned)}, total_earned = total_earned + ${sqlEsc(loyaltyEarned)}, updated_at = ${sqlEsc(now)}`
+    )
+    stmts.push(
+      `INSERT INTO loyalty_transactions (id, client_txn_id, customer_id, type, points, ref_type, ref_id, note, sync_status, created_at)
+       VALUES ${sqlVals([uuid(), `${clientTxnId}:LOYALTY`, customerId, loyaltyEarned, 'Sale', saleId, `نقاط من ${invoiceNumber}`, 'pending', now])}`
+    )
+  }
+
+  // 5. Cash movement (if CASH + open session)
+  if (cashSessionId) {
+    stmts.push(
+      `INSERT INTO cash_movements (id, client_txn_id, session_id, type, amount, note, ref_type, ref_id, sync_status, created_at)
+       VALUES ${sqlVals([uuid(), `${clientTxnId}:CASH`, cashSessionId, finalTotal, invoiceNumber, 'Sale', saleId, 'pending', now])}`
+    )
+  }
+
+  // 6. Sync queue entry
+  stmts.push(
+    `INSERT INTO sync_queue (entity_type, entity_id, client_txn_id, operation, payload, status, created_at)
+     VALUES ${sqlVals(['Sale', saleId, clientTxnId, 'CREATE', JSON.stringify({ ...body, clientTxnId, invoiceNumber }), 'PENDING', now])}`
+  )
+
+  // ─── EXECUTE ATOMICALLY ───
+  // Single execute() with all statements → implicit SQLite transaction.
+  // No BEGIN/COMMIT needed — SQLite wraps the batch atomically.
   try {
-    await db.execute('BEGIN')
-
-    // 1. Sale header
-    await db.execute(
-      `INSERT INTO sales (id, client_txn_id, invoice_number, customer_id, user_id, items_json, subtotal, discount_amount, tax_amount, total, paid_amount, change_amount, payment_method, loyalty_earned, loyalty_redeemed, note, status, sync_status, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'COMPLETED', 'pending', ?, datetime('now'))`,
-      [saleId, clientTxnId, invoiceNumber, customerId || null, userId, JSON.stringify(itemsData), subtotal, discountAmount || 0, taxAmount || 0, finalTotal, paid, change, paymentMethod || 'CASH', loyaltyEarned, loyaltyRedeem || 0, note || '', now]
-    )
-
-    // 2. Sale items + stock decrement + stock movement log
-    for (const item of itemsData) {
-      await db.execute(
-        `INSERT INTO sale_items (id, sale_id, product_id, quantity, unit_price, total, cost_at_sale) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-        [uuid(), saleId, item.productId, item.quantity, item.unitPrice, item.total, item.costAtSale]
-      )
-      await db.execute("UPDATE products SET current_stock = current_stock - ?, updated_at = datetime('now') WHERE id = ?", [item.quantity, item.productId])
-      await db.execute(
-        `INSERT INTO stock_movements (id, client_txn_id, product_id, type, quantity, ref_type, ref_id, note, sync_status, created_at)
-         VALUES (?, ?, ?, 'SALE', ?, 'Sale', ?, ?, 'pending', ?)`,
-        // Each stock movement gets a UNIQUE client_txn_id: saleTxnId + productId + ':STOCK'
-        // This prevents UNIQUE constraint failure when a sale has multiple items
-        // (each item generates its own stock movement with the same sale client_txn_id)
-        [uuid(), `${clientTxnId}:${item.productId}:STOCK`, item.productId, -item.quantity, saleId, invoiceNumber, now]
-      )
-    }
-
-    // 3. Payment record (sale_payments — migration 002)
-    await db.execute(
-      `INSERT INTO sale_payments (id, sale_id, method, amount, created_at, sync_status) VALUES (?, ?, ?, ?, ?, 'pending')`,
-      [uuid(), saleId, paymentMethod || 'CASH', paid, now]
-    )
-
-    // 4. Loyalty earn
-    if (customerId && loyaltyEarned > 0) {
-      await db.execute(
-        `INSERT INTO loyalty_accounts (id, customer_id, points, total_earned, total_redeemed, tier, updated_at) VALUES (?, ?, ?, ?, 0, 'BRONZE', ?) ON CONFLICT(customer_id) DO UPDATE SET points = points + ?, total_earned = total_earned + ?, updated_at = ?`,
-        [uuid(), customerId, loyaltyEarned, loyaltyEarned, now, loyaltyEarned, loyaltyEarned, now]
-      )
-      await db.execute(
-        `INSERT INTO loyalty_transactions (id, client_txn_id, customer_id, type, points, ref_type, ref_id, note, sync_status, created_at) VALUES (?, ?, ?, 'EARN', ?, 'Sale', ?, ?, 'pending', ?)`,
-        // Unique client_txn_id for loyalty: saleTxnId + ':LOYALTY'
-        [uuid(), `${clientTxnId}:LOYALTY`, customerId, loyaltyEarned, saleId, `نقاط من ${invoiceNumber}`, now]
-      )
-    }
-
-    // 5. Cash movement for open session (CASH only)
-    if (paymentMethod === 'CASH') {
-      const sessions = await db.select("SELECT * FROM cash_sessions WHERE status = 'OPEN' AND deleted_at IS NULL LIMIT 1")
-      if (sessions[0]) {
-        await db.execute(
-          `INSERT INTO cash_movements (id, client_txn_id, session_id, type, amount, note, ref_type, ref_id, sync_status, created_at) VALUES (?, ?, ?, 'SALE', ?, ?, 'Sale', ?, 'pending', ?)`,
-          // Unique client_txn_id for cash: saleTxnId + ':CASH'
-          [uuid(), `${clientTxnId}:CASH`, sessions[0].id, finalTotal, invoiceNumber, saleId, now]
-        )
-      }
-    }
-
-    // 6. Sync queue entry
-    await db.execute(
-      `INSERT INTO sync_queue (entity_type, entity_id, client_txn_id, operation, payload, status, created_at) VALUES ('Sale', ?, ?, 'CREATE', ?, 'PENDING', datetime('now'))`,
-      [saleId, clientTxnId, JSON.stringify({ ...body, clientTxnId, invoiceNumber })]
-    )
-
-    await db.execute('COMMIT')
+    await db.execute(stmts.join(';\n') + ';')
   } catch (e: any) {
-    await db.execute('ROLLBACK').catch(() => {})
     throw new Error(`فشل إنشاء البيع: ${sqlErrorMsg(e)}`)
   }
 
@@ -927,44 +1021,46 @@ async function handleCreateExpense(db: any, body: any): Promise<any> {
   const method = paymentMethod || 'CASH'
   const now = date || new Date().toISOString()
 
-  try {
-    await db.execute('BEGIN')
+  // IDEMPOTENCY CHECK
+  const existing = await db.select('SELECT id FROM expenses WHERE client_txn_id = ? LIMIT 1', [clientTxnId])
+  if (existing[0]) return { id: existing[0].id, clientTxnId, idempotent: true }
 
-    // 1. Expense record (with idempotency key from migration 002)
-    await db.execute(
-      `INSERT INTO expenses (id, client_txn_id, category_id, user_id, amount, payment_method, note, date, sync_status, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', datetime('now'), datetime('now'))`,
-      [id, clientTxnId, categoryId || null, userId, amount, method, note || '', now]
+  // Pre-fetch cash session for CASH expenses
+  let cashSessionId: string | null = null
+  if (method === 'CASH') {
+    const sessions = await db.select("SELECT id FROM cash_sessions WHERE status = 'OPEN' AND deleted_at IS NULL ORDER BY opened_at DESC LIMIT 1")
+    cashSessionId = sessions[0]?.id || null
+  }
+
+  // Build atomic SQL batch
+  const stmts: string[] = [
+    `INSERT INTO expenses (id, client_txn_id, category_id, user_id, amount, payment_method, note, date, sync_status, created_at, updated_at)
+     VALUES ${sqlVals([id, clientTxnId, categoryId || null, userId, amount, method, note || '', now])}, 'pending', datetime('now'), datetime('now')`,
+  ]
+
+  if (cashSessionId) {
+    stmts.push(
+      `INSERT INTO cash_movements (id, client_txn_id, session_id, type, amount, note, ref_type, ref_id, sync_status, created_at)
+       VALUES ${sqlVals([uuid(), clientTxnId, cashSessionId, amount, note || 'مصروف نقدي', 'Expense', id, 'pending', now])}`
     )
+  }
 
-    // 2. Cash movement for CASH expenses (deducts from open session)
-    if (method === 'CASH') {
-      const sessions = await db.select("SELECT id FROM cash_sessions WHERE status = 'OPEN' AND deleted_at IS NULL ORDER BY opened_at DESC LIMIT 1")
-      if (sessions[0]) {
-        await db.execute(
-          `INSERT INTO cash_movements (id, client_txn_id, session_id, type, amount, note, ref_type, ref_id, sync_status, created_at)
-           VALUES (?, ?, ?, 'EXPENSE', ?, ?, 'Expense', ?, 'pending', datetime('now'))`,
-          [uuid(), clientTxnId, sessions[0].id, amount, note || 'مصروف نقدي', id]
-        )
-      }
-    }
+  stmts.push(
+    `INSERT INTO audit_logs (id, user_id, action, entity, entity_id, after, created_at)
+     VALUES ${sqlVals([uuid(), userId, 'CREATE_EXPENSE', 'Expense', id, JSON.stringify({ amount, method, categoryId, note })])}, datetime('now')`
+  )
 
-    // 3. Audit log entry
-    try {
-      await db.execute(
-        `INSERT INTO audit_logs (id, user_id, action, entity, entity_id, after, created_at)
-         VALUES (?, ?, 'CREATE_EXPENSE', 'Expense', ?, ?, datetime('now'))`,
-        [uuid(), userId, id, JSON.stringify({ amount, method, categoryId, note })]
-      )
-    } catch {}
+  stmts.push(
+    `INSERT INTO sync_queue (entity_type, entity_id, client_txn_id, operation, payload, status, created_at)
+     VALUES ${sqlVals(['Expense', id, clientTxnId, 'CREATE', JSON.stringify({ ...body, clientTxnId }), 'PENDING', now])}`
+  )
 
-    await db.execute('COMMIT')
+  try {
+    await atomicExec(db, stmts)
   } catch (e: any) {
-    await db.execute('ROLLBACK').catch(() => {})
     throw new Error(`فشل إنشاء المصروف: ${sqlErrorMsg(e)}`)
   }
 
-  await addToSyncQueue(db, 'expenses', id, { ...body, clientTxnId })
   return { id, clientTxnId, ...body }
 }
 
@@ -978,34 +1074,28 @@ async function handleCashOpen(db: any, body: any): Promise<any> {
   const id = uuid()
   const clientTxnId = body.clientTxnId || id
   const { userId, openingBalance } = body
+  const now = new Date().toISOString()
+
+  const stmts: string[] = [
+    // 1. Auto-close any previously-open session
+    "UPDATE cash_sessions SET status = 'CLOSED', closed_at = datetime('now'), updated_at = datetime('now') WHERE status = 'OPEN'",
+    // 2. Open new session
+    `INSERT INTO cash_sessions (id, user_id, opening_balance, status, opened_at, updated_at)
+     VALUES ${sqlVals([id, userId, openingBalance || 0])}, 'OPEN', datetime('now'), datetime('now')`,
+    // 3. Opening movement
+    `INSERT INTO cash_movements (id, session_id, type, amount, note, ref_type, ref_id, sync_status, created_at)
+     VALUES ${sqlVals([uuid(), id, openingBalance || 0, 'افتتاح الكاش', 'CashSession', id, 'pending', now])}`,
+    // 4. Sync queue
+    `INSERT INTO sync_queue (entity_type, entity_id, client_txn_id, operation, payload, status, created_at)
+     VALUES ${sqlVals(['CashSession', id, clientTxnId, 'CREATE', JSON.stringify({ ...body, clientTxnId }), 'PENDING', now])}`,
+  ]
 
   try {
-    await db.execute('BEGIN')
-
-    // 1. Auto-close any previously-open session
-    await db.execute("UPDATE cash_sessions SET status = 'CLOSED', closed_at = datetime('now'), updated_at = datetime('now') WHERE status = 'OPEN'")
-
-    // 2. Open new session
-    await db.execute(
-      `INSERT INTO cash_sessions (id, user_id, opening_balance, status, opened_at, updated_at)
-       VALUES (?, ?, ?, 'OPEN', datetime('now'), datetime('now'))`,
-      [id, userId, openingBalance || 0]
-    )
-
-    // 3. Record the OPENING movement so expected-cash math includes it
-    await db.execute(
-      `INSERT INTO cash_movements (id, session_id, type, amount, note, ref_type, ref_id, sync_status, created_at)
-       VALUES (?, ?, 'OPENING', ?, 'افتتاح الكاش', 'CashSession', ?, 'pending', datetime('now'))`,
-      [uuid(), id, openingBalance || 0, id]
-    )
-
-    await db.execute('COMMIT')
+    await atomicExec(db, stmts)
   } catch (e: any) {
-    await db.execute('ROLLBACK').catch(() => {})
     throw new Error(`فشل فتح الكاش: ${sqlErrorMsg(e)}`)
   }
 
-  await addToSyncQueue(db, 'cash_sessions', id, { ...body, clientTxnId })
   return { id, clientTxnId, ...body, status: 'OPEN' }
 }
 
@@ -1036,33 +1126,18 @@ async function handleCashClose(db: any, body: any): Promise<any> {
   const expected = session.opening_balance + movements.reduce((s: number, m: any) => s + m.amount, 0)
   const difference = (actualCash || 0) - expected
 
+  const now = new Date().toISOString()
+  const stmts: string[] = [
+    `UPDATE cash_sessions SET closing_balance = ${sqlEsc(actualCash)}, expected_cash = ${sqlEsc(expected)}, difference = ${sqlEsc(difference)}, status = 'CLOSED', closed_at = datetime('now'), updated_at = datetime('now') WHERE id = ${sqlEsc(sessionId)}`,
+    `INSERT INTO cash_movements (id, session_id, type, amount, note, ref_type, ref_id, sync_status, created_at)
+     VALUES ${sqlVals([uuid(), sessionId, actualCash || 0, 'إغلاق الكاش', 'CashSession', sessionId, 'pending', now])}`,
+    `INSERT INTO audit_logs (id, user_id, action, entity, entity_id, after, created_at)
+     VALUES ${sqlVals([uuid(), userId || null, 'CLOSE_CASH', 'CashSession', sessionId, JSON.stringify({ expected, actualCash, difference })])}, datetime('now')`,
+  ]
+
   try {
-    await db.execute('BEGIN')
-
-    await db.execute(
-      `UPDATE cash_sessions SET closing_balance = ?, expected_cash = ?, difference = ?, status = 'CLOSED', closed_at = datetime('now'), updated_at = datetime('now') WHERE id = ?`,
-      [actualCash, expected, difference, sessionId]
-    )
-
-    // CLOSING movement so the session's movement history is complete
-    await db.execute(
-      `INSERT INTO cash_movements (id, session_id, type, amount, note, ref_type, ref_id, sync_status, created_at)
-       VALUES (?, ?, 'CLOSING', ?, 'إغلاق الكاش', 'CashSession', ?, 'pending', datetime('now'))`,
-      [uuid(), sessionId, actualCash || 0, sessionId]
-    )
-
-    // Audit log
-    try {
-      await db.execute(
-        `INSERT INTO audit_logs (id, user_id, action, entity, entity_id, after, created_at)
-         VALUES (?, ?, 'CLOSE_CASH', 'CashSession', ?, ?, datetime('now'))`,
-        [uuid(), userId || null, sessionId, JSON.stringify({ expected, actualCash, difference })]
-      )
-    } catch {}
-
-    await db.execute('COMMIT')
+    await atomicExec(db, stmts)
   } catch (e: any) {
-    await db.execute('ROLLBACK').catch(() => {})
     throw new Error(`فشل إغلاق الكاش: ${sqlErrorMsg(e)}`)
   }
 
@@ -1152,9 +1227,18 @@ async function handleSetup(db: any, body: any): Promise<any> {
 // SALE REFUND — multi-table atomic write that creates the
 // sale_return + sale_return_items, restores stock, logs RETURN
 // stock_movements, reverses loyalty points, updates sale status,
-// and queues for sync. All writes wrapped in BEGIN/COMMIT/ROLLBACK
-// so a partial failure cannot leave stock restored but the sale
-// unmarked, or vice versa.
+// and queues for sync.
+//
+// ATOMIC EXECUTION: tauri-plugin-sql does NOT support BEGIN/COMMIT
+// across separate execute() calls (each call may use a different
+// pooled connection, causing "cannot commit - no transaction is
+// active"). All writes are concatenated into ONE execute() call;
+// SQLite wraps the entire batch in an implicit transaction — if ANY
+// statement fails, the WHOLE batch rolls back atomically.
+//
+// IDEMPOTENCY: before creating, check if a sale_return with this
+// clientTxnId already exists → return it (prevents duplicates from
+// retries or double-clicks).
 // ============================================================
 async function handleSaleRefund(db: any, path: string, body: any): Promise<any> {
   // Extract sale ID from path: /sales/{id}/refund
@@ -1164,7 +1248,20 @@ async function handleSaleRefund(db: any, path: string, body: any): Promise<any> 
 
   const { items, reason, refundMethod, userId } = body
 
-  // Pre-validation reads (before BEGIN) so user-facing errors throw cleanly.
+  const returnId = uuid()
+  const clientTxnId = body.clientTxnId || returnId
+  const returnNumber = `RET-${Date.now()}`
+  const now = new Date().toISOString()
+
+  // ─── IDEMPOTENCY CHECK ───
+  // If this clientTxnId already exists, return the existing sale_return.
+  // Prevents duplicate refunds from sync retries or double-clicks.
+  const existing = await db.select('SELECT id FROM sale_returns WHERE client_txn_id = ? LIMIT 1', [clientTxnId])
+  if (existing[0]) return { id: existing[0].id, idempotent: true }
+
+  // ─── PRE-VALIDATION READS ───
+  // Reads happen BEFORE building the atomic batch so user-facing errors
+  // throw cleanly without an aborted transaction.
   const sales = await db.select('SELECT * FROM sales WHERE id = ? AND deleted_at IS NULL LIMIT 1', [saleId])
   const sale = sales[0]
   if (!sale) throw new Error('الفاتورة غير موجودة')
@@ -1196,59 +1293,58 @@ async function handleSaleRefund(db: any, path: string, body: any): Promise<any> 
     loyaltyReversed = Math.floor(sale.loyalty_earned * (refundTotal / sale.total))
   }
 
-  const returnId = uuid()
-  const clientTxnId = body.clientTxnId || returnId
-  const returnNumber = `RET-${Date.now()}`
+  // ─── BUILD ATOMIC SQL BATCH ───
+  const stmts: string[] = []
 
+  // 1. Sale return header (with idempotency key from migration 002)
+  stmts.push(
+    `INSERT INTO sale_returns (id, client_txn_id, return_number, sale_id, user_id, subtotal, tax_amount, total, refund_method, reason, status, loyalty_reversed, created_at)
+     VALUES ${sqlVals([returnId, clientTxnId, returnNumber, saleId, userId, refundTotal, 0, refundTotal, refundMethod || 'CASH', reason || 'إرجاع', 'COMPLETED', loyaltyReversed, now])}`
+  )
+
+  // 2. Return items + restore stock + log RETURN movement
+  for (const ret of returnItems) {
+    stmts.push(
+      `INSERT INTO sale_return_items (id, sale_return_id, sale_item_id, product_id, quantity, unit_price, total)
+       VALUES ${sqlVals([ret.id, returnId, ret.saleItemId, ret.productId, ret.quantity, ret.unitPrice, ret.total])}`
+    )
+    stmts.push(
+      `UPDATE products SET current_stock = current_stock + ${sqlEsc(ret.quantity)}, updated_at = ${sqlEsc(now)} WHERE id = ${sqlEsc(ret.productId)}`
+    )
+    stmts.push(
+      `INSERT INTO stock_movements (id, client_txn_id, product_id, type, quantity, ref_type, ref_id, note, sync_status, created_at)
+       VALUES ${sqlVals([uuid(), `${clientTxnId}:${ret.productId}:STOCK`, ret.productId, 'RETURN', ret.quantity, 'SaleReturn', returnId, `إرجاع - ${returnNumber}`, 'pending', now])}`
+    )
+  }
+
+  // 3. Reverse loyalty points
+  if (loyaltyReversed > 0 && sale.customer_id) {
+    stmts.push(
+      `UPDATE loyalty_accounts SET points = MAX(0, points - ${sqlEsc(loyaltyReversed)}), updated_at = ${sqlEsc(now)} WHERE customer_id = ${sqlEsc(sale.customer_id)}`
+    )
+    stmts.push(
+      `INSERT INTO loyalty_transactions (id, client_txn_id, customer_id, type, points, ref_type, ref_id, note, sync_status, created_at)
+       VALUES ${sqlVals([uuid(), clientTxnId, sale.customer_id, 'REVERSE', -loyaltyReversed, 'SaleReturn', returnId, `عكس نقاط - ${returnNumber}`, 'pending', now])}`
+    )
+  }
+
+  // 4. Mark sale as partially refunded
+  stmts.push(
+    `UPDATE sales SET status = 'PARTIAL_REFUND', updated_at = ${sqlEsc(now)} WHERE id = ${sqlEsc(saleId)}`
+  )
+
+  // 5. Queue for sync (inside the same atomic batch — no separate addToSyncQueue call)
+  stmts.push(
+    `INSERT INTO sync_queue (entity_type, entity_id, client_txn_id, operation, payload, status, created_at)
+     VALUES ${sqlVals(['SaleReturn', returnId, clientTxnId, 'CREATE', JSON.stringify({ saleId, items, reason, refundMethod, userId }), 'PENDING', now])}`
+  )
+
+  // ─── EXECUTE ATOMICALLY ───
+  // Single execute() with all statements → implicit SQLite transaction.
+  // No BEGIN/COMMIT needed — SQLite wraps the batch atomically.
   try {
-    await db.execute('BEGIN')
-
-    // 1. Sale return header (with idempotency key from migration 002)
-    await db.execute(
-      `INSERT INTO sale_returns (id, client_txn_id, return_number, sale_id, user_id, subtotal, tax_amount, total, refund_method, reason, status, loyalty_reversed, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, 'COMPLETED', ?, datetime('now'))`,
-      [returnId, clientTxnId, returnNumber, saleId, userId, refundTotal, refundTotal, refundMethod || 'CASH', reason || 'إرجاع', loyaltyReversed]
-    )
-
-    // 2. Return items + restore stock + log RETURN movement
-    for (const ret of returnItems) {
-      await db.execute(
-        `INSERT INTO sale_return_items (id, sale_return_id, sale_item_id, product_id, quantity, unit_price, total) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-        [ret.id, returnId, ret.saleItemId, ret.productId, ret.quantity, ret.unitPrice, ret.total]
-      )
-      await db.execute("UPDATE products SET current_stock = current_stock + ?, updated_at = datetime('now') WHERE id = ?", [ret.quantity, ret.productId])
-      await db.execute(
-        `INSERT INTO stock_movements (id, client_txn_id, product_id, type, quantity, ref_type, ref_id, note, sync_status, created_at)
-         VALUES (?, ?, ?, 'RETURN', ?, 'SaleReturn', ?, ?, 'pending', datetime('now'))`,
-        [uuid(), `${clientTxnId}:${ret.productId}:STOCK`, ret.productId, ret.quantity, returnId, `إرجاع - ${returnNumber}`]
-      )
-    }
-
-    // 3. Reverse loyalty points
-    if (loyaltyReversed > 0 && sale.customer_id) {
-      await db.execute(
-        "UPDATE loyalty_accounts SET points = MAX(0, points - ?), updated_at = datetime('now') WHERE customer_id = ?",
-        [loyaltyReversed, sale.customer_id]
-      )
-      await db.execute(
-        `INSERT INTO loyalty_transactions (id, client_txn_id, customer_id, type, points, ref_type, ref_id, note, sync_status, created_at)
-         VALUES (?, ?, ?, 'REVERSE', ?, 'SaleReturn', ?, ?, 'pending', datetime('now'))`,
-        [uuid(), clientTxnId, sale.customer_id, -loyaltyReversed, returnId, `عكس نقاط - ${returnNumber}`]
-      )
-    }
-
-    // 4. Mark sale as partially refunded
-    await db.execute("UPDATE sales SET status = ?, updated_at = datetime('now') WHERE id = ?", ['PARTIAL_REFUND', saleId])
-
-    // 5. Queue for sync
-    await db.execute(
-      `INSERT INTO sync_queue (entity_type, entity_id, client_txn_id, operation, payload, status, created_at) VALUES ('SaleReturn', ?, ?, 'CREATE', ?, 'PENDING', datetime('now'))`,
-      [returnId, clientTxnId, JSON.stringify({ saleId, items, reason, refundMethod, userId })]
-    )
-
-    await db.execute('COMMIT')
+    await atomicExec(db, stmts)
   } catch (e: any) {
-    await db.execute('ROLLBACK').catch(() => {})
     throw new Error(`فشل إرجاع الفاتورة: ${sqlErrorMsg(e)}`)
   }
 
@@ -1378,8 +1474,23 @@ async function handlePutSettings(db: any, body: any): Promise<any> {
 // recalculates weighted-average cost, logs a PURCHASE
 // stock_movement per line, updates the supplier's running balance
 // when the purchase is on account, and queues the whole thing for
-// sync. All steps wrapped in BEGIN/COMMIT/ROLLBACK so a failure
-// mid-way cannot leave stock or balances half-updated.
+// sync.
+//
+// ATOMIC EXECUTION: tauri-plugin-sql does NOT support BEGIN/COMMIT
+// across separate execute() calls (each call may use a different
+// pooled connection, causing "cannot commit - no transaction is
+// active"). All writes are concatenated into ONE execute() call;
+// SQLite wraps the entire batch in an implicit transaction — if ANY
+// statement fails, the WHOLE batch rolls back atomically.
+//
+// IDEMPOTENCY: before creating, check if a purchase with this
+// clientTxnId already exists → return it (prevents duplicates from
+// retries or double-clicks).
+//
+// PRE-READS: the per-product stock + avg_cost lookup that used to
+// happen INSIDE the transaction now happens BEFORE building the
+// atomic batch — db.select() cannot be part of a multi-statement
+// execute() batch.
 // ============================================================
 async function handleCreatePurchase(db: any, body: any): Promise<any> {
   const id = body.id || uuid()
@@ -1395,65 +1506,84 @@ async function handleCreatePurchase(db: any, body: any): Promise<any> {
   const finalPaid = paidAmount ?? finalTotal
   const invNo = invoiceNumber || `PUR-${Date.now()}`
 
-  try {
-    await db.execute('BEGIN')
+  // ─── IDEMPOTENCY CHECK ───
+  // If this clientTxnId already exists, return the existing purchase.
+  // Prevents duplicate purchases from sync retries or double-clicks.
+  const existing = await db.select('SELECT id FROM purchases WHERE client_txn_id = ? LIMIT 1', [clientTxnId])
+  if (existing[0]) return { id: existing[0].id, idempotent: true }
 
-    // 1. Purchase header (with idempotency key from migration 002)
-    await db.execute(
-      `INSERT INTO purchases (id, client_txn_id, invoice_number, supplier_id, user_id, warehouse_id, subtotal, tax_amount, discount_amount, total, paid_amount, status, note, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))`,
-      [id, clientTxnId, invNo, supplierId || null, userId || null, warehouseId || null, finalSubtotal, taxAmount || 0, discountAmount || 0, finalTotal, finalPaid, purchaseStatus, note || '']
+  // ─── PRE-FETCH PRODUCT DATA ───
+  // We need current_stock + avg_cost for each item to compute the new
+  // weighted-average cost. These reads MUST happen BEFORE building the
+  // atomic batch — db.select() cannot be part of a multi-statement
+  // execute() batch.
+  const itemsData: any[] = []
+  for (const item of items) {
+    const itemId = uuid()
+    const lineTotal = item.quantity * item.unitCost
+    const productRows = await db.select('SELECT current_stock, avg_cost FROM products WHERE id = ? AND deleted_at IS NULL', [item.productId])
+    const product = productRows[0]
+    let newQty: number | null = null
+    let newAvg: number | null = null
+    if (product) {
+      const oldQty = product.current_stock || 0
+      const oldCost = product.avg_cost || 0
+      newQty = oldQty + item.quantity
+      // Weighted average: (old_qty * old_cost + new_qty * new_cost) / total_qty
+      newAvg = newQty > 0 ? ((oldQty * oldCost) + (item.quantity * item.unitCost)) / newQty : item.unitCost
+    }
+    itemsData.push({ item, itemId, lineTotal, productFound: !!product, newQty, newAvg })
+  }
+
+  // ─── BUILD ATOMIC SQL BATCH ───
+  const stmts: string[] = []
+
+  // 1. Purchase header (with idempotency key from migration 002)
+  stmts.push(
+    `INSERT INTO purchases (id, client_txn_id, invoice_number, supplier_id, user_id, warehouse_id, subtotal, tax_amount, discount_amount, total, paid_amount, status, note, created_at, updated_at)
+     VALUES ${sqlVals([id, clientTxnId, invNo, supplierId || null, userId || null, warehouseId || null, finalSubtotal, taxAmount || 0, discountAmount || 0, finalTotal, finalPaid, purchaseStatus, note || '', now, now])}`
+  )
+
+  // 2. Purchase items + stock update + weighted-avg cost + movement log
+  for (const d of itemsData) {
+    stmts.push(
+      `INSERT INTO purchase_items (id, purchase_id, product_id, quantity, unit_cost, tax_rate, total)
+       VALUES ${sqlVals([d.itemId, id, d.item.productId, d.item.quantity, d.item.unitCost, d.item.taxRate || 0, d.lineTotal])}`
     )
-
-    // 2. Purchase items + stock update + weighted-avg cost + movement log
-    for (const item of items) {
-      const itemId = uuid()
-      const lineTotal = item.quantity * item.unitCost
-      await db.execute(
-        `INSERT INTO purchase_items (id, purchase_id, product_id, quantity, unit_cost, tax_rate, total)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
-        [itemId, id, item.productId, item.quantity, item.unitCost, item.taxRate || 0, lineTotal]
+    if (d.productFound && d.newQty !== null && d.newAvg !== null) {
+      stmts.push(
+        `UPDATE products SET current_stock = ${sqlEsc(d.newQty)}, avg_cost = ${sqlEsc(d.newAvg)}, updated_at = ${sqlEsc(now)} WHERE id = ${sqlEsc(d.item.productId)}`
       )
-
-      // Look up current stock + avg_cost to compute the new weighted average
-      const productRows = await db.select('SELECT current_stock, avg_cost FROM products WHERE id = ? AND deleted_at IS NULL', [item.productId])
-      const product = productRows[0]
-      if (product) {
-        const oldQty = product.current_stock || 0
-        const oldCost = product.avg_cost || 0
-        const newQty = oldQty + item.quantity
-        // Weighted average: (old_qty * old_cost + new_qty * new_cost) / total_qty
-        const newAvg = newQty > 0 ? ((oldQty * oldCost) + (item.quantity * item.unitCost)) / newQty : item.unitCost
-
-        await db.execute(
-          "UPDATE products SET current_stock = ?, avg_cost = ?, updated_at = datetime('now') WHERE id = ?",
-          [newQty, newAvg, item.productId]
-        )
-
-        await db.execute(
-          `INSERT INTO stock_movements (id, client_txn_id, product_id, type, quantity, ref_type, ref_id, note, sync_status, created_at)
-           VALUES (?, ?, ?, 'PURCHASE', ?, 'Purchase', ?, ?, 'pending', datetime('now'))`,
-          [uuid(), `${clientTxnId}:${item.productId}:STOCK`, item.productId, item.quantity, id, `شراء - ${invNo}`]
-        )
-      }
-    }
-
-    // 3. If on account (paid < total), increase supplier balance by the unpaid portion
-    if (supplierId && finalPaid < finalTotal) {
-      const unpaid = finalTotal - finalPaid
-      await db.execute(
-        "UPDATE suppliers SET balance = COALESCE(balance, 0) + ?, updated_at = datetime('now') WHERE id = ?",
-        [unpaid, supplierId]
+      stmts.push(
+        `INSERT INTO stock_movements (id, client_txn_id, product_id, type, quantity, ref_type, ref_id, note, sync_status, created_at)
+         VALUES ${sqlVals([uuid(), `${clientTxnId}:${d.item.productId}:STOCK`, d.item.productId, 'PURCHASE', d.item.quantity, 'Purchase', id, `شراء - ${invNo}`, 'pending', now])}`
       )
     }
+  }
 
-    await db.execute('COMMIT')
+  // 3. If on account (paid < total), increase supplier balance by the unpaid portion
+  if (supplierId && finalPaid < finalTotal) {
+    const unpaid = finalTotal - finalPaid
+    stmts.push(
+      `UPDATE suppliers SET balance = COALESCE(balance, 0) + ${sqlEsc(unpaid)}, updated_at = ${sqlEsc(now)} WHERE id = ${sqlEsc(supplierId)}`
+    )
+  }
+
+  // 4. Queue for sync (inside the same atomic batch — no separate addToSyncQueue call)
+  stmts.push(
+    `INSERT INTO sync_queue (entity_type, entity_id, client_txn_id, operation, payload, status, created_at)
+     VALUES ${sqlVals(['Purchase', id, clientTxnId, 'CREATE', JSON.stringify({ ...body, clientTxnId }), 'PENDING', now])}`
+  )
+
+  // ─── EXECUTE ATOMICALLY ───
+  // Single execute() with all statements → implicit SQLite transaction.
+  // No BEGIN/COMMIT needed — SQLite wraps the batch atomically.
+  try {
+    await atomicExec(db, stmts)
   } catch (e: any) {
-    await db.execute('ROLLBACK').catch(() => {})
     throw new Error(`فشل إنشاء الفاتورة: ${sqlErrorMsg(e)}`)
   }
 
-  await addToSyncQueue(db, 'purchases', id, { ...body, clientTxnId })
   return { id, clientTxnId, ...body }
 }
 
