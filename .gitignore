@@ -32,10 +32,14 @@ next-env.d.ts
 # ===========================
 # Environment Files
 # ===========================
+# Ignore all real env files, but KEEP the .env.example template
 .env
 .env.local
-.env.*
-.env*
+.env.production
+.env.development
+.env.*.local
+# Whitelist the example template (committed for documentation)
+!.env.example
 
 # ===========================
 # Database Files
