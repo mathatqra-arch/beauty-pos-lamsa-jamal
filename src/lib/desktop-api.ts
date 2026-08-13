@@ -1528,9 +1528,10 @@ async function handleCreatePurchase(db: any, body: any): Promise<any> {
     if (product) {
       const oldQty = product.current_stock || 0
       const oldCost = product.avg_cost || 0
-      newQty = oldQty + item.quantity
+      const updatedQty: number = oldQty + item.quantity
+      newQty = updatedQty
       // Weighted average: (old_qty * old_cost + new_qty * new_cost) / total_qty
-      newAvg = newQty > 0 ? ((oldQty * oldCost) + (item.quantity * item.unitCost)) / newQty : item.unitCost
+      newAvg = updatedQty > 0 ? ((oldQty * oldCost) + (item.quantity * item.unitCost)) / updatedQty : item.unitCost
     }
     itemsData.push({ item, itemId, lineTotal, productFound: !!product, newQty, newAvg })
   }
