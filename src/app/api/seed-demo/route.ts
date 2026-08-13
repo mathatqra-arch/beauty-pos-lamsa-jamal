@@ -149,8 +149,8 @@ export async function POST(req: NextRequest) {
           allowNegativeStock: false,
           avgCost: cost,
           active: true,
-          currentStock: stock,
-          syncStatus: 'synced',
+          // Note: currentStock + syncStatus are SQLite-only fields (desktop).
+          // In Supabase, stock is stored in the StockLevel table (below).
           stockLevels: warehouse ? {
             create: [{ warehouseId: warehouse.id, quantity: stock }]
           } : undefined,
@@ -181,16 +181,24 @@ export async function POST(req: NextRequest) {
     let customerCount = 0
     for (const [name, phone, email, tier] of customerData) {
       const points = tier === 'VIP' ? 5000 : tier === 'GOLD' ? 2000 : tier === 'SILVER' ? 800 : 100
-      await db.customer.create({
+      // In Supabase, loyalty is stored in a separate LoyaltyAccount table
+      // (not denormalized on Customer — that's SQLite-only).
+      const customer = await db.customer.create({
         data: {
           name,
           phone,
           email,
           tier,
           active: true,
-          loyaltyPoints: points,
-          totalEarned: points,
-          totalRedeemed: 0,
+          // Create the loyalty account in the same call (Prisma relation)
+          loyaltyAccount: {
+            create: {
+              points,
+              totalEarned: points,
+              totalRedeemed: 0,
+              tier,
+            },
+          },
         },
       })
       customerCount++
