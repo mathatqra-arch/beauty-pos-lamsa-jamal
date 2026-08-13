@@ -327,7 +327,8 @@ async function fetchWithAuth(url: string, init: RequestInit = {}): Promise<Respo
   if (isBrowser) {
     try {
       const { useAuthStore } = await import('../store')
-      token = useAuthStore.getState().token
+      // store.token is `string | null`; normalize to `string | undefined`
+      token = useAuthStore.getState().token ?? undefined
     } catch { /* store not ready */ }
   }
   const headers: Record<string, string> = {
