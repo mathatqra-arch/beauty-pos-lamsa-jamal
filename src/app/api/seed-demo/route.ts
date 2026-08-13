@@ -22,9 +22,14 @@ export async function POST(req: NextRequest) {
     const limited = applyRateLimit(req, 'setup', RATE_LIMITS.SETUP)
     if (limited) return limited
 
-    // ─── IDEMPOTENCY: skip if products already exist ───
+    // Parse body for optional force flag
+    const body = await req.json().catch(() => ({}))
+    const force = body?.force === true
+
+    // ─── IDEMPOTENCY: skip only if there's a substantial catalog (≥10 products)
+    // AND force=false. A few test products shouldn't block seeding the full demo.
     const existingProducts = await db.product.count()
-    if (existingProducts > 0) {
+    if (existingProducts >= 10 && !force) {
       const [customers, suppliers, categories] = await Promise.all([
         db.customer.count(),
         db.supplier.count(),
