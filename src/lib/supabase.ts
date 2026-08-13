@@ -1,38 +1,60 @@
 // ============================================================
-// SUPABASE SYNC HELPERS (stub)
+// لمسة جمال — Supabase helpers (re-export shim)
 // ============================================================
-// This module was previously a full Supabase sync implementation.
-// After Sprint 4 dead code cleanup, it's a stub that returns
-// "not available" messages. The sync functionality is handled
-// by sync-engine.ts and desktop-api.ts.
+// The old stub here has been replaced by the clean data layer in
+// src/lib/data/. This file re-exports the real implementations so
+// existing imports (`@/lib/supabase`) keep working without code churn.
+//
+// Migrate imports to:  import { ... } from '@/lib/data'
 // ============================================================
 
-export async function exportLocalToSupabase(): Promise<{ success: boolean; uploaded: number; message: string }> {
+export {
+  testSupabaseConnection,
+  syncNow as importFromSupabaseTrigger,
+} from './data/sync'
+
+/**
+ * Export the local DB → Supabase (runs a full sync push).
+ * Replaces the old exportLocalToSupabase stub.
+ */
+export async function exportLocalToSupabase(): Promise<{
+  success: boolean; uploaded: number; message: string
+}> {
+  const { runFullSync } = await import('./data/sync')
+  const res = await runFullSync()
   return {
-    success: false,
-    uploaded: 0,
-    message: 'تصدير Supabase غير متاح — استخدم sync engine المدمج',
+    success: res.errors === 0,
+    uploaded: res.pushed,
+    message: res.errors === 0
+      ? `تم رفع ${res.pushed} عملية بنجاح`
+      : `تم رفع ${res.pushed} مع ${res.errors} أخطاء`,
   }
 }
 
-export async function importFromSupabase(): Promise<{ success: boolean; downloaded: number; message: string }> {
+/**
+ * Import (pull) from Supabase → local DB.
+ * Replaces the old importFromSupabase stub.
+ */
+export async function importFromSupabase(): Promise<{
+  success: boolean; downloaded: number; message: string
+}> {
+  const { runFullSync } = await import('./data/sync')
+  const res = await runFullSync()
   return {
-    success: false,
-    downloaded: 0,
-    message: 'استيراد Supabase غير متاح — استخدم sync engine المدمج',
+    success: res.errors === 0,
+    downloaded: res.pulled,
+    message: res.errors === 0
+      ? `تم تنزيل ${res.pulled} تحديث`
+      : `تم تنزيل ${res.pulled} مع ${res.errors} أخطاء`,
   }
 }
 
-export async function testSupabaseConnection(url: string, key: string): Promise<{ success: boolean; message: string }> {
-  if (!url || !key) {
-    return { success: false, message: 'URL و Key مطلوبان' }
-  }
-  return {
-    success: false,
-    message: 'اختبار الاتصال غير متاح — sync engine يتعامل مع هذا تلقائياً',
-  }
-}
-
+/**
+ * Whether Supabase credentials are configured.
+ */
 export function isSupabaseConfigured(): boolean {
-  return false
+  if (typeof window !== 'undefined') {
+    return !!(process.env.NEXT_PUBLIC_SUPABASE_URL && process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY)
+  }
+  return !!(process.env.NEXT_PUBLIC_SUPABASE_URL || process.env.SUPABASE_URL)
 }
