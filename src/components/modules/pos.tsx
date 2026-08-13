@@ -113,7 +113,19 @@ export function POSModule() {
   const handleBarcode = async (barcode: string) => {
     const code = barcode.trim()
     if (!code) return
-    const product = products.find(p => p.barcode === code || (p.barcodes && JSON.parse(p.barcodes).includes(code)))
+    // Safe barcode lookup — try/catch around JSON.parse for malformed barcodes array
+    const product = products.find(p => {
+      if (p.barcode === code) return true
+      if (p.barcodes) {
+        try {
+          const extra = JSON.parse(p.barcodes)
+          return Array.isArray(extra) && extra.includes(code)
+        } catch {
+          return false
+        }
+      }
+      return false
+    })
     if (product) {
       addToCart(product)
       toast.success(`${product.nameAr || product.name} - تمت الإضافة`, { duration: 1500 })
@@ -156,11 +168,35 @@ export function POSModule() {
     return matchCat && matchSearch && p.active
   })
 
-  const subtotal = cart.items.reduce((s, i) => s + i.price * i.quantity, 0)
-  const taxAmount = cart.items.reduce((s, i) => s + (i.price * i.quantity * i.taxRate / 100), 0)
-  const loyaltyDiscount = cart.loyaltyRedeem * 0.05 // 0.05 EGP per point
-  const totalDiscount = cart.discountAmount + loyaltyDiscount
-  const total = Math.max(0, subtotal + taxAmount - totalDiscount)
+  // ============================================================
+  // CALCULATIONS — single source of truth (no duplication)
+  // ============================================================
+  // Fix: percent discount was treated as fixed EGP amount.
+  // Now: if discountType === 'PERCENT', discount = subtotal * amount / 100
+  //       if discountType === 'FIXED', discount = amount (clamped to subtotal)
+  // ============================================================
+  const calcTotals = useCallback(() => {
+    const subtotal = cart.items.reduce((s, i) => s + i.price * i.quantity, 0)
+    const taxAmount = cart.items.reduce((s, i) => s + (i.price * i.quantity * i.taxRate / 100), 0)
+    const loyaltyDiscount = cart.loyaltyRedeem * 0.05 // 0.05 EGP per point
+
+    // Fix: apply discount type correctly
+    let discountAmount = 0
+    if (cart.discountType === 'PERCENT') {
+      discountAmount = subtotal * (cart.discountAmount || 0) / 100
+    } else {
+      discountAmount = cart.discountAmount || 0
+    }
+    // Clamp: discount cannot exceed subtotal (+ tax is not discounted)
+    discountAmount = Math.min(discountAmount, subtotal)
+
+    const totalDiscount = discountAmount + loyaltyDiscount
+    const total = Math.max(0, subtotal + taxAmount - totalDiscount)
+
+    return { subtotal, taxAmount, discountAmount, loyaltyDiscount, totalDiscount, total }
+  }, [cart.items, cart.discountAmount, cart.discountType, cart.loyaltyRedeem])
+
+  const { subtotal, taxAmount, discountAmount, loyaltyDiscount, totalDiscount, total } = calcTotals()
 
   const handleHold = () => {
     if (cart.items.length === 0) { toast.error('السلة فارغة'); return }
@@ -169,11 +205,8 @@ export function POSModule() {
   }
 
   const handleCompleteSale = async (paymentData: any) => {
-    const subtotal = cart.items.reduce((s, i) => s + i.price * i.quantity, 0)
-    const taxAmount = cart.items.reduce((s, i) => s + (i.price * i.quantity * i.taxRate / 100), 0)
-    const loyaltyDiscount = cart.loyaltyRedeem * 0.05
-    const totalDiscount = cart.discountAmount + loyaltyDiscount
-    const total = Math.max(0, subtotal + taxAmount - totalDiscount)
+    // Use the SAME calcTotals — no duplication, no drift
+    const { subtotal, taxAmount, discountAmount, loyaltyDiscount, totalDiscount, total } = calcTotals()
 
     // Build sale object with items (for receipt)
     const saleData = {
@@ -218,8 +251,13 @@ export function POSModule() {
           items: cart.items.map(i => ({ productId: i.productId, quantity: i.quantity })),
           customerId: cart.customerId,
           userId: user?.id,
-          discountAmount: cart.discountAmount,
+          // Send the COMPUTED discount (fixed EGP), not the raw input.
+          // The server's handleCreateSale expects a fixed amount.
+          discountAmount: discountAmount,
           discountType: cart.discountType,
+          subtotal,
+          taxAmount,
+          total,
           paymentMethod: paymentData.method,
           paymentDetails: paymentData.details,
           paidAmount: paymentData.paid,
@@ -348,34 +386,38 @@ export function POSModule() {
         </ScrollArea>
       </div>
 
-      {/* RIGHT: Cart */}
-      <div className="w-[400px] shrink-0 border-l bg-card flex flex-col">
-        {/* Cart header */}
-        <div className="p-3 border-b">
-          <div className="flex items-center justify-between mb-2">
-            <h2 className="font-bold flex items-center gap-2">
+      {/* RIGHT: Cart — branded with purple/teal gradient accents */}
+      <div className="w-[420px] shrink-0 border-l bg-card flex flex-col shadow-lg">
+        {/* Cart header — gradient accent */}
+        <div className="bg-brand-gradient p-4 text-primary-foreground">
+          <div className="flex items-center justify-between mb-3">
+            <h2 className="font-bold flex items-center gap-2 text-lg">
               <ShoppingCart className="w-5 h-5" />
               الفاتورة الحالية
             </h2>
             {cart.items.length > 0 && (
-              <Button variant="ghost" size="sm" onClick={() => cart.clearCart()}>
+              <Button variant="ghost" size="sm" onClick={() => cart.clearCart()} className="text-primary-foreground hover:bg-primary-foreground/20">
                 <Trash2 className="w-4 h-4 ml-1" />
                 مسح
               </Button>
             )}
           </div>
-          {/* Customer */}
+          {/* Customer — clearly optional with visual affordance */}
           <Button
             variant={cart.customerId ? 'secondary' : 'outline'}
-            className="w-full justify-start h-10"
+            className="w-full justify-start h-11 bg-primary-foreground/15 border-primary-foreground/30 text-primary-foreground hover:bg-primary-foreground/25"
             onClick={() => setCustomerOpen(true)}
           >
             <User className="w-4 h-4 ml-2" />
-            {cart.customerName || 'إضافة عميل (F3)'}
-            {cart.customerId && (
-              <Badge variant="secondary" className="mr-auto">
-                {cart.loyaltyPoints} نقطة
-              </Badge>
+            {cart.customerName ? (
+              <>
+                <span className="font-medium">{cart.customerName}</span>
+                <Badge className="mr-auto bg-brand-gold text-primary-foreground">
+                  {cart.loyaltyPoints} نقطة
+                </Badge>
+              </>
+            ) : (
+              <span className="text-primary-foreground/80">إضافة عميل (اختياري) — F3</span>
             )}
           </Button>
         </div>
@@ -386,12 +428,12 @@ export function POSModule() {
             {cart.items.length === 0 ? (
               <div className="text-center py-16 text-muted-foreground">
                 <ShoppingCart className="w-12 h-12 mx-auto mb-3 opacity-30" />
-                <p>السلة فارغة</p>
+                <p className="font-medium">السلة فارغة</p>
                 <p className="text-xs mt-1">امسح الباركود أو اضغط على منتج</p>
               </div>
             ) : (
               cart.items.map(item => (
-                <div key={item.productId} className="bg-muted/30 rounded-lg p-2.5">
+                <div key={item.productId} className="bg-muted/30 rounded-xl p-3 border border-border/50 hover:border-primary/30 transition-colors">
                   <div className="flex items-start gap-2 mb-2">
                     <div className="flex-1 min-w-0">
                       <p className="text-sm font-medium truncate">
@@ -404,24 +446,24 @@ export function POSModule() {
                     <Button
                       variant="ghost"
                       size="icon"
-                      className="h-7 w-7 shrink-0 text-destructive"
+                      className="h-7 w-7 shrink-0 text-destructive hover:bg-destructive/10"
                       onClick={() => cart.removeItem(item.productId)}
                     >
                       <X className="w-4 h-4" />
                     </Button>
                   </div>
                   <div className="flex items-center gap-2">
-                    <div className="flex items-center bg-background rounded-md">
+                    <div className="flex items-center bg-background rounded-lg border border-border">
                       <Button
                         variant="ghost"
                         size="icon"
-                        className="h-7 w-7"
+                        className="h-7 w-7 hover:bg-primary/10 hover:text-primary"
                         onClick={() => cart.updateQuantity(item.productId, item.quantity - 1)}
                       >
                         <Minus className="w-3 h-3" />
                       </Button>
                       <Input
-                        className="h-7 w-12 text-center pos-number border-0 px-0"
+                        className="h-7 w-12 text-center pos-number border-0 px-0 font-bold"
                         value={item.quantity}
                         onChange={(e) => {
                           const qty = parseInt(e.target.value) || 0
@@ -431,13 +473,13 @@ export function POSModule() {
                       <Button
                         variant="ghost"
                         size="icon"
-                        className="h-7 w-7"
+                        className="h-7 w-7 hover:bg-primary/10 hover:text-primary"
                         onClick={() => cart.updateQuantity(item.productId, item.quantity + 1)}
                       >
                         <Plus className="w-3 h-3" />
                       </Button>
                     </div>
-                    <span className="text-sm font-bold mr-auto pos-number">
+                    <span className="text-sm font-bold mr-auto pos-number text-primary">
                       {formatEGP(item.price * item.quantity)}
                     </span>
                   </div>
@@ -447,36 +489,40 @@ export function POSModule() {
           </div>
         </ScrollArea>
 
-        {/* Summary & actions */}
-        <div className="border-t p-3 space-y-2">
+        {/* Summary & actions — branded */}
+        <div className="border-t bg-muted/20 p-4 space-y-3">
           <div className="space-y-1.5 text-sm">
             <div className="flex justify-between text-muted-foreground">
               <span>المجموع الفرعي</span>
-              <span className="pos-number">{formatEGP(subtotal)}</span>
+              <span className="pos-number font-medium">{formatEGP(subtotal)}</span>
             </div>
             <div className="flex justify-between text-muted-foreground">
-              <span>الضريبة</span>
-              <span className="pos-number">{formatEGP(taxAmount)}</span>
+              <span>الضريبة (14%)</span>
+              <span className="pos-number font-medium">{formatEGP(taxAmount)}</span>
             </div>
             {totalDiscount > 0 && (
-              <div className="flex justify-between text-green-600">
-                <span>الخصم {cart.loyaltyRedeem > 0 && `(${cart.loyaltyRedeem} نقطة)`}</span>
+              <div className="flex justify-between text-brand-teal font-medium">
+                <span>
+                  الخصم
+                  {cart.discountType === 'PERCENT' && ` (${cart.discountAmount}%)`}
+                  {cart.loyaltyRedeem > 0 && ` + ${cart.loyaltyRedeem} نقطة`}
+                </span>
                 <span className="pos-number">- {formatEGP(totalDiscount)}</span>
               </div>
             )}
-            <Separator />
-            <div className="flex justify-between text-lg font-bold">
-              <span>الإجمالي</span>
-              <span className="pos-number text-primary">{formatEGP(total)}</span>
+            <Separator className="my-2" />
+            <div className="flex justify-between items-baseline">
+              <span className="text-base font-bold">الإجمالي</span>
+              <span className="pos-number text-2xl font-bold text-primary">{formatEGP(total)}</span>
             </div>
           </div>
 
-          {/* Quick action buttons */}
-          <div className="grid grid-cols-4 gap-1.5">
+          {/* Quick action buttons — branded icons */}
+          <div className="grid grid-cols-4 gap-2">
             <Button
               variant="outline"
               size="sm"
-              className="h-10 flex-col text-[10px] gap-0.5"
+              className="h-12 flex-col text-[10px] gap-0.5 hover:border-primary hover:text-primary"
               onClick={() => setDiscountOpen(true)}
               disabled={cart.items.length === 0}
             >
@@ -487,7 +533,7 @@ export function POSModule() {
             <Button
               variant="outline"
               size="sm"
-              className="h-10 flex-col text-[10px] gap-0.5"
+              className="h-12 flex-col text-[10px] gap-0.5 hover:border-primary hover:text-primary"
               onClick={handleHold}
               disabled={cart.items.length === 0}
             >
@@ -498,7 +544,7 @@ export function POSModule() {
             <Button
               variant="outline"
               size="sm"
-              className="h-10 flex-col text-[10px] gap-0.5"
+              className="h-12 flex-col text-[10px] gap-0.5 hover:border-primary hover:text-primary"
               onClick={() => setHeldOpen(true)}
             >
               <Play className="w-4 h-4" />
@@ -508,7 +554,7 @@ export function POSModule() {
             <Button
               variant="outline"
               size="sm"
-              className="h-10 flex-col text-[10px] gap-0.5"
+              className="h-12 flex-col text-[10px] gap-0.5 hover:border-primary hover:text-primary"
               onClick={() => setCustomerOpen(true)}
             >
               <User className="w-4 h-4" />
@@ -517,15 +563,16 @@ export function POSModule() {
             </Button>
           </div>
 
+          {/* Checkout button — prominent gradient, clear "تمام" label */}
           <Button
             size="lg"
-            className="w-full h-14 text-base font-bold"
+            className="w-full h-16 text-lg font-bold bg-brand-gradient hover:opacity-90 shadow-lg hover:shadow-primary/30 transition-all"
             disabled={cart.items.length === 0}
             onClick={() => setPaymentOpen(true)}
           >
-            <CreditCard className="w-5 h-5 ml-2" />
-            دفع {formatEGP(total)}
-            <span className="kbd mr-2 bg-primary-foreground/20">F8</span>
+            <CreditCard className="w-6 h-6 ml-2" />
+            تمام — دفع {formatEGP(total)}
+            <span className="kbd mr-2 bg-primary-foreground/20 border-primary-foreground/30 text-primary-foreground">F8</span>
           </Button>
         </div>
       </div>
